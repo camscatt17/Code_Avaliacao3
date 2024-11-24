@@ -13,10 +13,12 @@ class Broker:
         self.voters = {}  # Armazena os votantes (somente no líder)
         self.observers = []  # Lista de observadores conectados (somente no líder)
         self.confirmations = {}  # Armazena confirmações por offset
+        self.heartbeat_interval = 10 # Intervalo máximo para receber um heartbeat (em segundos)
 
         if self.role == "leader":
             self.commit_index = -1  # Último índice confirmado
-        print(f"Broker {broker_id} iniciado com {role} em um cluster de {broker_id} brokers.")
+            self.voter_heartbeats = {}  # Inicializa o dicionário para monitorar heartbeats
+        print(f"Broker {broker_id} iniciado com {role}.")
 
     def register_broker(self, broker_id, role, proxy):
         if self.role != "leader":
@@ -26,13 +28,79 @@ class Broker:
         
         if role == "voter":
             self.voters[broker_id] = proxy_obj
+            self.voter_heartbeats[broker_id] = time.time()  # Inicializa o registro de heartbeat
             print(f"Líder {self.broker_id}: Votante {broker_id} registrado.")
         elif role == "observer":
             self.observers.append(proxy_obj)
             print(f"Líder {self.broker_id}: Observador {broker_id} registrado.")
         else:
             print(f"Líder {self.broker_id}: Papel '{role}' desconhecido para broker {broker_id}.")
+    
+    def heartbeat(self):
+        if self.role != "voter":
+            raise Exception("Apenas votantes enviam heartbeats.")
+        while True:
+            try:
+                self.leader_proxy.receive_heartbeat(self.broker_id)
+                print(f"Votante {self.broker_id}: Heartbeat enviado ao líder.")
+            except Exception as e:
+                print(f"Votante {self.broker_id}: Falha ao enviar heartbeat: {e}")
+            time.sleep(self.heartbeat_interval / 2)  # Envia heartbeat a cada metade do intervalo permitido
+    
+    def receive_heartbeat(self, voter_id):
+        if self.role != "leader":
+            raise Exception("Apenas o líder pode receber heartbeats.")
+        self.voter_heartbeats[voter_id] = time.time()
+        print(f"Líder {self.broker_id}: Heartbeat recebido de votante {voter_id}.")
+     
+    def monitor_voters(self):
+        while True:
+            current_time = time.time()
+            unavailable_voters = []
+            for voter_id, last_heartbeat in self.voter_heartbeats.items():
+                if current_time - last_heartbeat > self.heartbeat_interval:
+                    unavailable_voters.append(voter_id)
 
+            for voter_id in unavailable_voters:
+                print(f"Líder {self.broker_id}: Votante {voter_id} indisponível.")
+                del self.voters[voter_id]
+                del self.voter_heartbeats[voter_id]
+
+                # Verifica se ainda há quorum suficiente
+                if len(self.voters) < (len(self.voters) // 2) + 1:
+                    self.promote_observer_to_voter()
+
+            time.sleep(2)  # Intervalo de monitoramento
+
+    def promote_observer_to_voter(self):
+        if self.observers:
+            new_voter_proxy = self.observers.pop(0)
+            new_voter_id = f"voter-{len(self.voters) + 1}"  # Cria um ID único para o novo votante
+            self.voters[new_voter_id] = new_voter_proxy
+            self.voter_heartbeats[new_voter_id] = time.time()
+
+            print(f"Líder {self.broker_id}: Observador promovido a votante: {new_voter_id}")
+
+            # Notifica os demais votantes
+            for voter in self.voters.values():
+                voter.notify_new_voter(new_voter_id)
+
+            # Sincroniza os dados para o novo votante
+            new_voter_proxy.synchronize_with_leader(self.broker_id)
+    
+    def notify_new_voter(self, new_voter_id):
+        print(f"Votante {self.broker_id}: Notificado sobre novo votante: {new_voter_id}.")
+    
+    def synchronize_with_leader(self, leader_id):
+        if self.role != "voter":
+            raise Exception("Apenas votantes podem sincronizar com o líder.")
+        try:
+            data = self.leader_proxy.get_committed_log()
+            self.log = data
+            print(f"Votante {self.broker_id}: Dados sincronizados com o líder {leader_id}.")
+        except Exception as e:
+            print(f"Votante {self.broker_id}: Erro ao sincronizar com o líder: {e}")
+    
     def append_entry(self, data):
         if self.role != "leader":
             raise Exception("Apenas o líder pode receber gravações.")
@@ -150,6 +218,10 @@ def start_broker(broker_id, role):
             broker.leader_proxy = leader_proxy
             leader_proxy.register_broker(broker_id, role, uri)
             print(f"Broker {broker_id} registrado como '{role}' e conectado ao líder.")
+            
+            # Inicia o envio de heartbeats se for votante
+            if role == "voter":
+                threading.Thread(target=broker.heartbeat, daemon=True).start()
         except Exception as e:
             print(f"Erro ao conectar ao líder: {e}")
             return
